@@ -36,12 +36,12 @@ rate() {
   br=$(grep -oE '^[0-9]+\.[0-9]+' <<<"$ver")
   up=$(grep -oE '^[0-9]+\.[0-9]+\.[0-9]+' <<<"$ver")
   fx=$(fixed_for "$br")
-  if [ -n "$changelog" ] && [ -f "$changelog" ] && zgrep -qE 'CVE-2026-10961[89]' "$changelog"; then
+  if [ "$fx" != EOL ] && [ "$(printf '%s\n' "$fx" "$up" | sort -V | head -1)" = "$fx" ]; then
+    echo "  PATCHED              $label  $ver"
+  elif [ -n "$changelog" ] && [ -f "$changelog" ] && zgrep -qE 'CVE-2026-10961[89]' "$changelog"; then
     echo "  PATCHED (backport)   $label  $ver"
   elif [ "$fx" = EOL ]; then
     echo "  EOL, NO FIX          $label  $ver"
-  elif [ "$(printf '%s\n' "$fx" "$up" | sort -V | head -1)" = "$fx" ]; then
-    echo "  PATCHED              $label  $ver"
   else
     echo "  NOT PATCHED          $label  $ver  (needs >= $fx)"
   fi
@@ -96,7 +96,7 @@ hunt() {
 }
 
 php_in() {
-  docker exec "$1" sh -c 'command -v php >/dev/null 2>&1 && php -r "echo PHP_VERSION;"' 2>/dev/null
+  docker exec "$1" sh -c 'for p in php $(ls /usr/bin /usr/local/bin 2>/dev/null | grep -E "^php[0-9]+$"); do command -v "$p" >/dev/null 2>&1 && exec "$p" -r "echo PHP_VERSION;"; done' 2>/dev/null
 }
 
 docker_upgrade() {
@@ -157,14 +157,14 @@ docker_upgrade() {
   fi
   st=$(rate "docker:$c" "$new")
   echo "     after update:$st"
-  if [ "$new" = "$old" ]; then
-    echo "     image has no fix yet; stop the container or restrict access until the maintainer publishes one"
+  if [[ "$st" == *"NOT PATCHED"* ]]; then
+    echo "     latest image ($old -> $new) has no fix yet; stop the container or restrict access until the maintainer publishes one"
   fi
 }
 
 run_local() {
   echo "== $(hostname)"
-  local found=0 branches br pkgs c v f p log before after s st
+  local found=0 branches br pkgs c v f p u log before after s st
   if command -v dpkg-query >/dev/null; then
     branches=$(installed 'php*-common' | grep -oE '^php[0-9]+\.[0-9]+-common$' | sed -E 's/^php|-common$//g')
     if [ "$UPGRADE" = 1 ] && [ -n "$branches" ]; then
@@ -222,7 +222,13 @@ run_local() {
   [ "$found" = 0 ] && echo "  no PHP found"
   for f in $(grep -lE '(libphp[^/ ]*|php-fpm[^/ ]*|bin/php[^/ ]*|/lib/php/[^ ]*) \(deleted\)$' /proc/[0-9]*/maps 2>/dev/null); do
     p=${f//[^0-9]/}
-    echo "  OLD PHP STILL IN MEMORY: PID $p ($(ps -p "$p" -o comm= 2>/dev/null)), restart that service"
+    u=$(ps -p "$p" -o unit= 2>/dev/null | tr -d ' ')
+    echo "  OLD PHP STILL IN MEMORY: PID $p ($(ps -p "$p" -o args= 2>/dev/null | cut -c1-80))"
+    if [ -n "$u" ] && [ "$u" != "-" ]; then
+      echo "     restart with: systemctl restart $u"
+    else
+      echo "     not a systemd service, restart that process manually"
+    fi
   done
   [ "$found" = 1 ] && hunt
 }
