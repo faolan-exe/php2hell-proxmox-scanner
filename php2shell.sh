@@ -1,18 +1,21 @@
 #!/bin/bash
 UPGRADE=0
+UPGRADE_DOCKER=0
 LOCAL=0
 SINCE=2026-10-20
 for a in "$@"; do
   case "$a" in
     --upgrade) UPGRADE=1 ;;
+    --upgrade-docker) UPGRADE_DOCKER=1 ;;
     --local) LOCAL=1 ;;
     --since=*) SINCE=${a#--since=} ;;
     -h|--help)
-      echo "Usage: $0 [--upgrade] [--local] [--since=YYYY-MM-DD]"
-      echo "  (no flags)  check only, on a Proxmox node all running LXCs"
-      echo "  --upgrade   upgrade apt-installed PHP and restart apache2/php-fpm"
-      echo "  --local     only check this host, do not iterate LXCs"
-      echo "  --since     reference date for the heuristics (default $SINCE)"
+      echo "Usage: $0 [--upgrade] [--upgrade-docker] [--local] [--since=YYYY-MM-DD]"
+      echo "  (no flags)        check only, on a Proxmox node all running LXCs"
+      echo "  --upgrade         upgrade apt-installed PHP and restart apache2/php-fpm"
+      echo "  --upgrade-docker  pull and recreate unpatched Docker Compose services, then re-check"
+      echo "  --local           only check this host, do not iterate LXCs"
+      echo "  --since           reference date for the heuristics (default $SINCE)"
       exit 0 ;;
     *) echo "Unknown option: $a (see --help)"; exit 1 ;;
   esac
@@ -92,9 +95,76 @@ hunt() {
   [ "$HITS" = 0 ] && echo "  nothing suspicious"
 }
 
+php_in() {
+  docker exec "$1" sh -c 'command -v php >/dev/null 2>&1 && php -r "echo PHP_VERSION;"' 2>/dev/null
+}
+
+docker_upgrade() {
+  local c="$1" old="$2" proj dir files svc img f fargs fl log i new st
+  case "$c" in
+    nextcloud-aio-*)
+      echo "     skipped: managed by Nextcloud AIO, update via the AIO interface (stop containers, update mastercontainer, start and update)"
+      return ;;
+  esac
+  lbl() { docker inspect -f "{{index .Config.Labels \"$1\"}}" "$c" 2>/dev/null; }
+  proj=$(lbl com.docker.compose.project)
+  dir=$(lbl com.docker.compose.project.working_dir)
+  files=$(lbl com.docker.compose.project.config_files)
+  svc=$(lbl com.docker.compose.service)
+  img=$(docker inspect -f '{{.Config.Image}}' "$c" 2>/dev/null)
+  if [ -z "$svc" ] || [ -z "$files" ]; then
+    echo "     skipped: not a Docker Compose container; pull $img and recreate it with its original docker run options (--restart always)"
+    return
+  fi
+  fargs=()
+  IFS=',' read -ra fl <<<"$files"
+  for f in "${fl[@]}"; do
+    if [ ! -f "$f" ]; then
+      echo "     skipped: compose file $f not found on this host (Portainer stack?), update it where it is managed"
+      return
+    fi
+    fargs+=(-f "$f")
+  done
+  if ! docker compose version >/dev/null 2>&1; then
+    echo "     skipped: 'docker compose' plugin not installed"
+    return
+  fi
+  log=$(mktemp)
+  echo "     docker compose pull $svc ($img) ..."
+  if ! docker compose -p "$proj" --project-directory "$dir" "${fargs[@]}" pull "$svc" >"$log" 2>&1; then
+    echo "     ERROR: pull failed:"
+    tail -3 "$log" | sed 's/^/       /'
+    rm -f "$log"
+    return
+  fi
+  echo "     docker compose up -d $svc ..."
+  if ! docker compose -p "$proj" --project-directory "$dir" "${fargs[@]}" up -d "$svc" >"$log" 2>&1; then
+    echo "     ERROR: recreate failed:"
+    tail -3 "$log" | sed 's/^/       /'
+    rm -f "$log"
+    return
+  fi
+  rm -f "$log"
+  new=""
+  for i in $(seq 1 30); do
+    new=$(php_in "$c")
+    [[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] && break
+    sleep 1
+  done
+  if ! [[ "$new" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+    echo "     WARNING: container did not come back within 30s, check: docker logs $c"
+    return
+  fi
+  st=$(rate "docker:$c" "$new")
+  echo "     after update:$st"
+  if [ "$new" = "$old" ]; then
+    echo "     image has no fix yet; stop the container or restrict access until the maintainer publishes one"
+  fi
+}
+
 run_local() {
   echo "== $(hostname)"
-  local found=0 branches br pkgs c v f p log before after s
+  local found=0 branches br pkgs c v f p log before after s st
   if command -v dpkg-query >/dev/null; then
     branches=$(installed 'php*-common' | grep -oE '^php[0-9]+\.[0-9]+-common$' | sed -E 's/^php|-common$//g')
     if [ "$UPGRADE" = 1 ] && [ -n "$branches" ]; then
@@ -140,10 +210,12 @@ run_local() {
   fi
   if command -v docker >/dev/null; then
     for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
-      v=$(docker exec "$c" sh -c 'command -v php >/dev/null 2>&1 && php -r "echo PHP_VERSION;"' 2>/dev/null)
+      v=$(php_in "$c")
       if [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
         found=1
-        rate "docker:$c" "$v"
+        st=$(rate "docker:$c" "$v")
+        echo "$st"
+        [ "$UPGRADE_DOCKER" = 1 ] && [[ "$st" == *"NOT PATCHED"* ]] && docker_upgrade "$c" "$v"
       fi
     done
   fi
@@ -159,6 +231,7 @@ if [ "$LOCAL" = 0 ] && command -v pct >/dev/null; then
   self=$(readlink -f "$0")
   args=(--local "--since=$SINCE")
   [ "$UPGRADE" = 1 ] && args+=(--upgrade)
+  [ "$UPGRADE_DOCKER" = 1 ] && args+=(--upgrade-docker)
   for id in $(pct list | awk 'NR>1 && $2=="running"{print $1}'); do
     if ! pct exec "$id" -- test -x /bin/bash; then
       echo "== CT $id: no bash, skipped"
