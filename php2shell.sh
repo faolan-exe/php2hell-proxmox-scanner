@@ -85,7 +85,7 @@ hunt() {
     show "crontab of $u" "$(crontab -l -u "$u" 2>/dev/null | grep -vE '^\s*(#|$)')"
   done
   if command -v docker >/dev/null; then
-    for c in $(docker ps --format '{{.Names}}'); do
+    for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
       show "docker diff $c" "$(docker diff "$c" 2>/dev/null | awk '$1!="D"' | grep -E '\.(php|phtml|phar)$')"
     done
   fi
@@ -94,18 +94,44 @@ hunt() {
 
 run_local() {
   echo "== $(hostname)"
-  local found=0 branches br pkgs c v f p
+  local found=0 branches br pkgs c v f p log before after s
   if command -v dpkg-query >/dev/null; then
     branches=$(installed 'php*-common' | grep -oE '^php[0-9]+\.[0-9]+-common$' | sed -E 's/^php|-common$//g')
     if [ "$UPGRADE" = 1 ] && [ -n "$branches" ]; then
-      apt-get update -qq
+      log=$(mktemp)
+      echo "  -- apt-get update ..."
+      if ! apt-get -o Acquire::Retries=5 update -qq >"$log" 2>&1; then
+        echo "     WARNING: apt-get update reported errors:"
+        grep -E '^(E|W|Err):' "$log" | head -5 | sed 's/^/       /'
+      fi
       for br in $branches; do
         pkgs=$(installed "php$br*" "libapache2-mod-php$br")
-        [ -n "$pkgs" ] && apt-get -o Acquire::Retries=20 install -y -qq --only-upgrade $pkgs >/dev/null
-        for s in apache2 "php$br-fpm"; do
-          systemctl is-active -q "$s" && systemctl restart "$s"
-        done
+        [ -z "$pkgs" ] && continue
+        before=$(dpkg-query -W -f='${Version}' "php$br-common")
+        echo "  -- upgrading PHP $br ($(wc -w <<<"$pkgs") packages, currently $before) ..."
+        if apt-get -o Acquire::Retries=20 install -y -q --only-upgrade $pkgs >"$log" 2>&1; then
+          after=$(dpkg-query -W -f='${Version}' "php$br-common")
+          if [ "$before" = "$after" ]; then
+            echo "     no newer version in the repository, still $after"
+          else
+            echo "     upgraded: $before -> $after"
+            for s in apache2 "php$br-fpm"; do
+              if systemctl is-active -q "$s"; then
+                if systemctl restart "$s"; then
+                  echo "     restarted $s"
+                else
+                  echo "     ERROR: restart of $s failed, check: systemctl status $s"
+                fi
+              fi
+            done
+          fi
+        else
+          echo "     ERROR: apt-get install failed:"
+          grep -E '^(E|Err):' "$log" | head -5 | sed 's/^/       /'
+          echo "     try again later, the repository may be overloaded"
+        fi
       done
+      rm -f "$log"
     fi
     for br in $branches; do
       found=1
@@ -113,7 +139,7 @@ run_local() {
     done
   fi
   if command -v docker >/dev/null; then
-    for c in $(docker ps --format '{{.Names}}'); do
+    for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
       v=$(docker exec "$c" sh -c 'command -v php >/dev/null 2>&1 && php -r "echo PHP_VERSION;"' 2>/dev/null)
       if [[ "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
         found=1
