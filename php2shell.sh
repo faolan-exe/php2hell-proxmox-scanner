@@ -89,7 +89,7 @@ hunt() {
   done
   if command -v docker >/dev/null; then
     for c in $(docker ps --format '{{.Names}}' 2>/dev/null); do
-      show "docker diff $c" "$(docker diff "$c" 2>/dev/null | awk '$1!="D"' | grep -E '\.(php|phtml|phar)$')"
+      show "docker diff $c" "$(docker diff "$c" 2>/dev/null | awk '$1!="D"' | grep -E '\.(php|phtml|phar)$' | grep -v ' /tmp/twig-cache/')"
     done
   fi
   [ "$HITS" = 0 ] && echo "  nothing suspicious"
